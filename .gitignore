@@ -1,3 +1,10 @@
+*
+!Main/
+!Main/**
+!model/
+!model/**
+!README.md
+
 __pycache__/
 *.pyc
 .ipynb_checkpoints/
