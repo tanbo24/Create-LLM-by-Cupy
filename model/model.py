@@ -105,6 +105,19 @@ class Cupa_ver4:
         self.gqa_cache_attn = bool(model_dic.get('gqa_cache_attn', False))
         self.swiglu_cache_gate = bool(model_dic.get('swiglu_cache_gate', False))
 
+        # ZeRO3/FSDP-like communication hiding options.
+        self.zero3_param_prefetch = bool(model_dic.get('zero3_param_prefetch', True))
+        self.zero3_forward_param_prefetch = bool(model_dic.get('zero3_forward_param_prefetch', self.zero3_param_prefetch))
+        self.zero3_backward_param_prefetch = bool(model_dic.get('zero3_backward_param_prefetch', self.zero3_param_prefetch))
+        self.zero3_reduce_progress = bool(model_dic.get('zero3_reduce_progress', True))
+        self.zero3_max_pending_reduces = int(model_dic.get('zero3_max_pending_reduces', 8))
+        self.zero3_grad_bucket = bool(model_dic.get('zero3_grad_bucket', True))
+        self.zero3_grad_bucket_flatten = bool(model_dic.get('zero3_grad_bucket_flatten', True))
+        self.zero3_grad_bucket_max_bytes = int(model_dic.get('zero3_grad_bucket_max_bytes', 256 * 1024 * 1024))
+        self.zero3_owner_grad_bucket = bool(model_dic.get('zero3_owner_grad_bucket', True))
+        self.zero3_embedding_grad_bucket = bool(model_dic.get('zero3_embedding_grad_bucket', True))
+        self.zero3_embedding_grad_bucket_max_bytes = int(model_dic.get('zero3_embedding_grad_bucket_max_bytes', 64 * 1024 * 1024))
+
         flash_backend = str(model_dic.get("flash_backend", "none"))
         flash_block_m = int(model_dic.get("flash_block_m", 64))
         flash_block_n = int(model_dic.get("flash_block_n", 64))
@@ -127,11 +140,54 @@ class Cupa_ver4:
                 layer.cache_gate = self.swiglu_cache_gate
 
 
+    def _make_layer_groups(self):
+        block_size = self.one_cycle_num
+        blocks_per_gather = getattr(self, "keep_layer_num", 1)
+        group_size = block_size * blocks_per_gather
+        groups = []
+        for group_start in range(0, len(self.layers), group_size):
+            group_end = min(group_start + group_size, len(self.layers))
+            groups.append((group_start, group_end, self.layers[group_start:group_end]))
+        return groups
+
+    def _maybe_progress_reduces(self, manager):
+        if getattr(self, "zero3_reduce_progress", True) and hasattr(manager, "progress_async_reduces"):
+            manager.progress_async_reduces(
+                max_pending=getattr(self, "zero3_max_pending_reduces", 8),
+                force=False,
+            )
+
+    def _use_grad_bucket(self, manager):
+        return bool(
+            getattr(self, "zero3_grad_bucket", True)
+            and getattr(manager, "enable_grad_bucket", False)
+            and hasattr(manager, "begin_grad_bucket")
+            and hasattr(manager, "add_grads_to_bucket")
+            and hasattr(manager, "flush_grad_bucket_async")
+        )
+
+    def _use_forward_prefetch(self, manager):
+        return bool(
+            getattr(self, "zero3_forward_param_prefetch", getattr(self, "zero3_param_prefetch", True))
+            and getattr(manager, "enable_forward_param_prefetch", getattr(manager, "enable_param_prefetch", False))
+            and hasattr(manager, "prefetch_modules")
+            and hasattr(manager, "wait_modules")
+        )
+
+    def _use_backward_prefetch(self, manager):
+        return bool(
+            getattr(self, "zero3_backward_param_prefetch", getattr(self, "zero3_param_prefetch", True))
+            and getattr(manager, "enable_backward_param_prefetch", getattr(manager, "enable_param_prefetch", False))
+            and hasattr(manager, "prefetch_modules")
+            and hasattr(manager, "wait_modules")
+        )
+
     def forward(self, x, t, x_pa, manager):
         self.grads = []
 
         # ---------------------------------------------------------
-        # Embedding gather
+        # Embedding gather. keep_embedding_until_backward=True keeps this
+        # live through backward and removes one huge re-broadcast.
         # ---------------------------------------------------------
         W = manager.gather_embedding()
         if self.padding_id is not None:
@@ -145,46 +201,39 @@ class Cupa_ver4:
         pad_mask = self.make_mask(x_pa)
 
         # ---------------------------------------------------------
-        # Transformer blocks
-        #
-        # self.layers の並び:
-        # [GQA0, feed0, norm1_0, norm2_0,
-        #  GQA1, feed1, norm1_1, norm2_1,
-        #  ...]
-        #
-        # one_cycle_num = 4
-        # keep_layer_num = 2 なら、2 block 分 = 8 module をまとめて gather
+        # Transformer blocks with optional forward prefetch.
+        # Backward prefetch is usually more important; forward prefetch can be
+        # disabled separately if VRAM pressure is high.
         # ---------------------------------------------------------
         block_size = self.one_cycle_num
-        blocks_per_gather = getattr(self, "keep_layer_num", 1)
-        group_size = block_size * blocks_per_gather
+        layer_groups = self._make_layer_groups()
+        use_prefetch = self._use_forward_prefetch(manager)
 
-        for group_start in range(0, len(self.layers), group_size):
-            group_end = min(group_start + group_size, len(self.layers))
-            group_modules = self.layers[group_start:group_end]
+        if use_prefetch and layer_groups:
+            manager.prefetch_modules(layer_groups[0][2], tag="fwd_group_0")
 
-            # 複数block分のparamsをまとめてgather
-            manager.gather_modules(group_modules)
+        for group_idx, (group_start, group_end, group_modules) in enumerate(layer_groups):
+            if use_prefetch:
+                manager.wait_modules(group_modules)
+                next_idx = group_idx + 1
+                if next_idx < len(layer_groups):
+                    manager.prefetch_modules(layer_groups[next_idx][2], tag=f"fwd_group_{next_idx}")
+            else:
+                manager.gather_modules(group_modules)
 
-            # group内をforward順に処理
             for block_start in range(0, len(group_modules), block_size):
-                GQA, feed, norm1, norm2 = group_modules[
-                    block_start:block_start + block_size
-                ]
+                GQA, feed, norm1, norm2 = group_modules[block_start:block_start + block_size]
 
-                # PreNorm Attention block
                 out = x
                 x = norm1.forward(x)
                 x = GQA.forward(x, pad_mask, self.gqa_pack)
                 x += out
 
-                # PreNorm FFN block
                 out = x
                 x = norm2.forward(x)
                 x = feed.forward(x)
                 x += out
 
-            # group分のfull paramsをrelease
             manager.release_modules(group_modules)
 
         self.x_pa = x_pa
@@ -201,8 +250,6 @@ class Cupa_ver4:
         # ---------------------------------------------------------
         loss = self.AF_Cross_loss.forward(x, t, W)
 
-        # backwardで同じembedding Wを使うので、通常はここでreleaseしない。
-        # これで80k x 3072のembedding broadcastをmicrobatchごとに1回削減できる。
         if not self.keep_embedding_until_backward:
             manager.release_embedding()
 
@@ -214,7 +261,7 @@ class Cupa_ver4:
 
     def backward(self, GradScale, manager):
         # ---------------------------------------------------------
-        # Embedding gather
+        # Embedding gather/reuse
         # ---------------------------------------------------------
         W = manager.get_live_embedding()
         if W is None:
@@ -222,12 +269,28 @@ class Cupa_ver4:
         if self.padding_id is not None:
             W[self.padding_id, :] = 0
 
+        layer_groups = self._make_layer_groups()
+        use_bwd_prefetch = self._use_backward_prefetch(manager)
+
+        # Key improvement: prefetch the last transformer group BEFORE CE
+        # backward. CE backward is heavy, so this hides the first backward
+        # param gather under useful compute instead of waiting after CE.
+        if use_bwd_prefetch and layer_groups:
+            last_idx = len(layer_groups) - 1
+            manager.prefetch_modules(layer_groups[last_idx][2], tag=f"bwd_group_{last_idx}_early")
+
         def grad_writer(s, e, dW_chunk):
-            manager.accumulate_grad_slice(W, s, e, dW_chunk)
+            if hasattr(manager, "accumulate_grad_slice_bucketed"):
+                manager.accumulate_grad_slice_bucketed(W, s, e, dW_chunk)
+            else:
+                manager.accumulate_grad_slice(W, s, e, dW_chunk)
+            self._maybe_progress_reduces(manager)
 
         # ---------------------------------------------------------
-        # CrossEntropy backward
-        # dWはchunkごとにgrad_writerでZeRO3 shardへreduce
+        # CrossEntropy backward. Its large embedding/LM-head dW chunks are now
+        # buffered/reduced owner-wise by the manager instead of one reduce per
+        # chunk. The manager flushes periodically, so comm overlaps with later
+        # CE chunks.
         # ---------------------------------------------------------
         norm_y = self.AF_Cross_loss.x
         dout, _ = self.AF_Cross_loss.backward(
@@ -235,6 +298,9 @@ class Cupa_ver4:
             GradScale,
             grad_writer=grad_writer,
         )
+        if hasattr(manager, "flush_embedding_grad_bucket_async"):
+            manager.flush_embedding_grad_bucket_async(tag="embedding_ce_tail")
+        self._maybe_progress_reduces(manager)
 
         # ---------------------------------------------------------
         # Final RMSNorm backward
@@ -243,80 +309,87 @@ class Cupa_ver4:
 
         dout = self.norm_.backward(dout, norm_y)
         manager.accumulate_grads(self.norm_.params, self.norm_.grads)
+        self._maybe_progress_reduces(manager)
         self.norm_.grads = None
 
         manager.release_module(self.norm_)
 
         # ---------------------------------------------------------
-        # Transformer blocks backward
-        #
-        # forwardでは group を前から処理したので、
-        # backwardでは group を後ろから処理する。
-        #
-        # group内でも block を後ろから処理する。
-        # 各blockのbackward順:
-        # feed -> norm2 -> GQA -> norm1
+        # Transformer blocks backward. Backward-side param prefetch is prioritized:
+        # group i-1 is prefetched while group i is computing.
         # ---------------------------------------------------------
         block_size = self.one_cycle_num
-        blocks_per_gather = getattr(self, "keep_layer_num", 1)
-        group_size = block_size * blocks_per_gather
 
-        for group_end in range(len(self.layers), 0, -group_size):
-            group_start = max(0, group_end - group_size)
-            group_modules = self.layers[group_start:group_end]
+        for group_idx in range(len(layer_groups) - 1, -1, -1):
+            group_start, group_end, group_modules = layer_groups[group_idx]
 
-            # 複数block分のparamsをまとめてgather
-            manager.gather_modules(group_modules)
+            if use_bwd_prefetch:
+                manager.wait_modules(group_modules)
+                prev_idx = group_idx - 1
+                if prev_idx >= 0:
+                    manager.prefetch_modules(layer_groups[prev_idx][2], tag=f"bwd_group_{prev_idx}")
+            else:
+                manager.gather_modules(group_modules)
 
-            # group内のblockを逆順に処理
             for block_start in range(len(group_modules) - block_size, -1, -block_size):
-                GQA, feed, norm1, norm2 = group_modules[
-                    block_start:block_start + block_size
-                ]
+                GQA, feed, norm1, norm2 = group_modules[block_start:block_start + block_size]
 
-                # forward時のcacheを取り出す
-                # GQA.cache[0] は norm1.forward後の入力相当
-                # feed.x は norm2.forward後の入力相当
                 norm1_y = GQA.cache[0]
                 norm2_y = feed.x
 
-                # -------------------------
-                # FFN branch backward
-                # x = feed(norm2(x)) + residual
-                # -------------------------
+                use_grad_bucket = self._use_grad_bucket(manager)
+                if use_grad_bucket:
+                    manager.begin_grad_bucket(tag=f"bwd_group{group_idx}_block{block_start // block_size}")
+
+                # FFN branch
                 out = dout
 
                 dout = feed.backward(dout)
-                manager.accumulate_grads(feed.params, feed.grads)
+                if use_grad_bucket:
+                    manager.add_grads_to_bucket(feed.params, feed.grads)
+                else:
+                    manager.accumulate_grads(feed.params, feed.grads)
+                    self._maybe_progress_reduces(manager)
                 feed.grads = None
 
                 dout = norm2.backward(dout, norm2_y)
-                manager.accumulate_grads(norm2.params, norm2.grads)
+                if use_grad_bucket:
+                    manager.add_grads_to_bucket(norm2.params, norm2.grads)
+                else:
+                    manager.accumulate_grads(norm2.params, norm2.grads)
+                    self._maybe_progress_reduces(manager)
                 norm2.grads = None
 
                 dout += out
 
-                # -------------------------
-                # Attention branch backward
-                # x = GQA(norm1(x)) + residual
-                # -------------------------
+                # Attention branch
                 out = dout
 
                 dout = GQA.backward(dout, self.gqa_pack)
-                manager.accumulate_grads(GQA.params, GQA.grads)
+                if use_grad_bucket:
+                    manager.add_grads_to_bucket(GQA.params, GQA.grads)
+                else:
+                    manager.accumulate_grads(GQA.params, GQA.grads)
+                    self._maybe_progress_reduces(manager)
                 GQA.grads = None
 
                 dout = norm1.backward(dout, norm1_y)
-                manager.accumulate_grads(norm1.params, norm1.grads)
+                if use_grad_bucket:
+                    manager.add_grads_to_bucket(norm1.params, norm1.grads)
+                    manager.flush_grad_bucket_async(tag=f"bwd_group{group_idx}_block{block_start // block_size}")
+                    self._maybe_progress_reduces(manager)
+                else:
+                    manager.accumulate_grads(norm1.params, norm1.grads)
+                    self._maybe_progress_reduces(manager)
                 norm1.grads = None
 
                 dout += out
 
-            # group分のfull paramsをrelease
             manager.release_modules(group_modules)
 
         # ---------------------------------------------------------
-        # Embedding backward
+        # Input embedding backward. Sparse rows are still computed locally, then
+        # reduced through the same embedding bucket path to reduce launch count.
         # ---------------------------------------------------------
         if self.dropout_rate != 0:
             dout = self.dropout_.backward(dout)
@@ -328,6 +401,9 @@ class Cupa_ver4:
             padding_id=self.padding_id,
             vocab_chunk_size=self.AF_Cross_loss.chunk_size,
         )
+        if hasattr(manager, "flush_embedding_grad_bucket_async"):
+            manager.flush_embedding_grad_bucket_async(tag="embedding_input_tail")
+        self._maybe_progress_reduces(manager)
 
         self.embed.idx = None
         manager.release_embedding()

@@ -8,6 +8,7 @@ from cupy.cuda import nccl
 from datetime import datetime
 from pathlib import Path
 from typing import Iterator, List, Optional
+from collections import deque
 
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
@@ -750,6 +751,46 @@ class MemoryZeRO3Manager:
         self.accum_micro_step = 0
         self._has_pending_reduces = False
 
+        # ==============================================================
+        # Communication hiding controls
+        # ==============================================================
+        # Async reduce buffers are tracked by event so old buffers can be
+        # released during backward while newer reductions keep overlapping.
+        self.pending_reduce_handles = deque()
+        self.max_pending_reduces = int(getattr(model, "zero3_max_pending_reduces", 8))
+        self.enable_reduce_progress = bool(getattr(model, "zero3_reduce_progress", True))
+
+        # Separate switches so backward prefetch can be prioritized even if
+        # forward prefetch is disabled due to VRAM pressure.
+        self.enable_forward_param_prefetch = bool(getattr(
+            model, "zero3_forward_param_prefetch", getattr(model, "zero3_param_prefetch", True)
+        ))
+        self.enable_backward_param_prefetch = bool(getattr(
+            model, "zero3_backward_param_prefetch", getattr(model, "zero3_param_prefetch", True)
+        ))
+        self.enable_param_prefetch = self.enable_forward_param_prefetch or self.enable_backward_param_prefetch
+
+        # Transformer block grad bucketization.
+        self.enable_grad_bucket = bool(getattr(model, "zero3_grad_bucket", True))
+        self.enable_grad_bucket_flatten = bool(getattr(model, "zero3_grad_bucket_flatten", True))
+        self.grad_bucket_max_bytes = int(getattr(model, "zero3_grad_bucket_max_bytes", 256 * 1024 * 1024))
+        self._grad_bucket_active = False
+        self._grad_bucket_items = []
+        self._grad_bucket_tag = ""
+
+        # Owner-wise reduce bucket: reduce-scatter-like behavior without
+        # changing the current ZeRO-3 owner-shard layout. Per owner, gradients
+        # are concatenated, reduced once, then scattered into grad_shard.
+        self.enable_owner_grad_bucket = bool(getattr(model, "zero3_owner_grad_bucket", True))
+
+        # Embedding/LM-head dW chunks are generated sequentially by CE backward.
+        # Buffer several chunks to reduce NCCL launch count, but flush often so
+        # communication still overlaps with later CE chunks.
+        self.enable_embedding_grad_bucket = bool(getattr(model, "zero3_embedding_grad_bucket", True))
+        self.embedding_grad_bucket_max_bytes = int(getattr(model, "zero3_embedding_grad_bucket_max_bytes", 64 * 1024 * 1024))
+        self._embedding_grad_bucket_items = []
+        self._embedding_grad_bucket_bytes = 0
+
         original_params = list(model.params)
         self.param_shapes = [p.shape for p in original_params]
         self.param_sizes = [int(p.size) for p in original_params]
@@ -852,6 +893,82 @@ class MemoryZeRO3Manager:
         self.live_param_to_idx[id(arr)] = param_idx
         return arr
 
+    def _broadcast_param_async(self, param_idx):
+        """Broadcast one full parameter on comm_stream without CPU sync."""
+        size = self.param_sizes[param_idx]
+        shape = self.param_shapes[param_idx]
+        owner = self.param_owners[param_idx]
+
+        recv = cp.empty(size, dtype=cp.float16)
+
+        if self.rank == owner:
+            local_off = self.param_offsets[param_idx] - owner * self.shard_size
+            src = self.param_shard_f16[local_off: local_off + size]
+            send_ptr = src.data.ptr
+        else:
+            send_ptr = recv.data.ptr
+
+        self.comm.broadcast(
+            send_ptr,
+            recv.data.ptr,
+            int(size),
+            nccl.NCCL_FLOAT16,
+            int(owner),
+            self.comm_stream.ptr,
+        )
+
+        arr = recv.reshape(shape)
+        self.live_param_to_idx[id(arr)] = param_idx
+        return arr
+
+    def prefetch_modules(self, modules, tag=None):
+        """Issue async param broadcasts for modules on comm_stream.
+
+        All ranks must call this in the same order. Call wait_modules() before
+        using the parameters. This is the CuPy/FSDP-like prefetch primitive.
+        """
+        modules = list(modules)
+        if not modules:
+            return
+
+        already_ready = True
+        for module in modules:
+            params = getattr(module, "params", None)
+            if params is None or any(p is None for p in params):
+                already_ready = False
+                break
+        if already_ready:
+            return
+
+        with self.comm_stream:
+            use_group = hasattr(nccl, "groupStart") and hasattr(nccl, "groupEnd")
+            if use_group:
+                nccl.groupStart()
+            try:
+                for module in modules:
+                    module.params = [
+                        self._broadcast_param_async(i)
+                        for i in module._zero3_param_indices
+                    ]
+            finally:
+                if use_group:
+                    nccl.groupEnd()
+
+        ev = cp.cuda.Event()
+        ev.record(self.comm_stream)
+        for module in modules:
+            module._zero3_param_ready_event = ev
+
+    def wait_modules(self, modules):
+        """Make compute stream wait for prefetched params without CPU sync."""
+        modules = list(modules)
+        seen = set()
+        for module in modules:
+            ev = getattr(module, "_zero3_param_ready_event", None)
+            if ev is not None and id(ev) not in seen:
+                self.stream.wait_event(ev)
+                seen.add(id(ev))
+
     def gather_module(self, module):
         """
         module 内の全paramをbroadcastしてから1回だけ同期する。
@@ -877,6 +994,8 @@ class MemoryZeRO3Manager:
                 if p is not None:
                     self.live_param_to_idx.pop(id(p), None)
             module.params = [None] * len(module.params)
+        if hasattr(module, "_zero3_param_ready_event"):
+            module._zero3_param_ready_event = None
 
     def release_modules(self, modules):
         for module in modules:
@@ -908,17 +1027,42 @@ class MemoryZeRO3Manager:
         self.model.Af_Em_para = [None]
 
     def zero_grad(self):
+        # Do not let stale async communication leak into the next optimizer step.
+        self.progress_async_reduces(force=True)
         self.grad_shard_f16.fill(0)
         self.kept_buffers = []
         self.accum_micro_step = 0
         self._has_pending_reduces = False
+        self._grad_bucket_active = False
+        self._grad_bucket_items = []
+        self._embedding_grad_bucket_items = []
+        self._embedding_grad_bucket_bytes = 0
 
     def flush_buckets(self):
-        # Direct reduce implementation, so nothing is buffered here.
-        pass
+        # Flush any open communication buckets. Transformer buckets are usually
+        # flushed in model.backward; embedding buckets can remain partially full.
+        self.flush_grad_bucket_async(tag="flush_buckets")
+        self.flush_embedding_grad_bucket_async(tag="flush_embedding_buckets")
+
+    def progress_async_reduces(self, max_pending=None, force=False):
+        """Release old async reduce buffers while preserving overlap.
+
+        force=False waits only enough to cap pending buffer count.
+        force=True waits for all pending reductions at a safe boundary.
+        """
+        if max_pending is None:
+            max_pending = self.max_pending_reduces
+        max_pending = int(max_pending)
+
+        while self.pending_reduce_handles and (force or len(self.pending_reduce_handles) > max_pending):
+            done_event, buffers, tag = self.pending_reduce_handles.popleft()
+            done_event.synchronize()
+            buffers.clear()
 
     def synchronize(self):
         had_pending = self._has_pending_reduces
+        self.flush_buckets()
+        self.progress_async_reduces(force=True)
         self.comm_stream.synchronize()
         self.stream.synchronize()
         self.kept_buffers = []
@@ -932,19 +1076,23 @@ class MemoryZeRO3Manager:
     def set_param_shard(self, updated_shard_f16):
         self.param_shard_f16[...] = updated_shard_f16
 
-    def _prepare_reduce_parts(self, items):
-        """Prepare NCCL reduce parts from [(global_start, flat_grad), ...].
+    def _normalize_grad_item(self, global_start, grad_flat):
+        if grad_flat is None:
+            return None
+        if grad_flat.dtype != cp.float16:
+            grad_flat = grad_flat.astype(cp.float16)
+        grad_flat = cp.ascontiguousarray(grad_flat.reshape(-1))
+        return int(global_start), grad_flat
 
-        The first microbatch can reduce directly into grad_shard_f16 because zero_grad()
-        already cleared it. Later microbatches reduce into temporary buffers and add.
-        """
+    def _prepare_reduce_parts(self, items):
+        """Prepare NCCL reduce parts from [(global_start, flat_grad), ...]."""
         parts = []
+        kept_buffers = []
         for global_start, grad_flat in items:
-            if grad_flat is None:
+            item = self._normalize_grad_item(global_start, grad_flat)
+            if item is None:
                 continue
-            if grad_flat.dtype != cp.float16:
-                grad_flat = grad_flat.astype(cp.float16)
-            grad_flat = cp.ascontiguousarray(grad_flat)
+            global_start, grad_flat = item
 
             global_end = int(global_start) + int(grad_flat.size)
             cur = int(global_start)
@@ -957,29 +1105,182 @@ class MemoryZeRO3Manager:
                 grad_off = int(cur - global_start)
                 send_part = cp.ascontiguousarray(grad_flat[grad_off: grad_off + part_count])
 
-                recv_ptr = 0
+                recv_ptr = send_part.data.ptr
                 recv_tmp = None
                 dst_off = None
                 direct_to_grad = False
                 if self.rank == owner:
+                    # Always reduce into a temporary buffer and add to grad_shard.
+                    # This is correct for tied embeddings where CE dW and input
+                    # embedding dW can touch the same rows in the same microbatch.
                     dst_off = int(cur - shard_start)
-                    if self.accum_micro_step == 0:
-                        # First microbatch: write SUM directly into the zeroed grad shard.
-                        recv_ptr = self.grad_shard_f16[dst_off: dst_off + part_count].data.ptr
-                        direct_to_grad = True
-                    else:
-                        # Later microbatches: preserve accumulated gradient and add after reduce.
-                        recv_tmp = cp.empty(part_count, dtype=cp.float16)
-                        recv_ptr = recv_tmp.data.ptr
+                    recv_tmp = cp.empty(part_count, dtype=cp.float16)
+                    recv_ptr = recv_tmp.data.ptr
 
                 parts.append((send_part, recv_ptr, part_count, int(owner), dst_off, recv_tmp, direct_to_grad))
-                self.kept_buffers.append(send_part)
+                kept_buffers.append(send_part)
                 if recv_tmp is not None:
-                    self.kept_buffers.append(recv_tmp)
+                    kept_buffers.append(recv_tmp)
                 cur = int(part_end)
-        return parts
+        return parts, kept_buffers
 
-    def _enqueue_reduce_parts(self, parts):
+    def _split_items_by_owner(self, items):
+        """Normalize grad items and split them at shard boundaries."""
+        entries = []
+        for global_start, grad_flat in items:
+            item = self._normalize_grad_item(global_start, grad_flat)
+            if item is None:
+                continue
+            g_start, flat = item
+            g_end = g_start + int(flat.size)
+            cur = g_start
+            while cur < g_end:
+                owner = int(cur // self.shard_size)
+                shard_start = owner * int(self.shard_size)
+                shard_end = shard_start + int(self.shard_size)
+                part_end = min(g_end, shard_end)
+                off = int(cur - g_start)
+                n = int(part_end - cur)
+                entries.append((owner, int(cur), cp.ascontiguousarray(flat[off:off + n])))
+                cur = int(part_end)
+        entries.sort(key=lambda x: (x[0], x[1]))
+        return entries
+
+    def _prepare_reduce_parts_flat_bucket(self, items):
+        """Combine adjacent global-offset spans before reducing."""
+        normalized = []
+        for global_start, grad_flat in items:
+            item = self._normalize_grad_item(global_start, grad_flat)
+            if item is not None:
+                normalized.append(item)
+        if not normalized:
+            return [], []
+        normalized.sort(key=lambda x: x[0])
+
+        runs = []
+        cur_start = None
+        cur_end = None
+        cur_owner = None
+        cur_views = []
+        cur_bytes = 0
+        max_bytes = max(1, int(self.grad_bucket_max_bytes))
+
+        def flush_run():
+            nonlocal cur_start, cur_end, cur_owner, cur_views, cur_bytes
+            if cur_views:
+                runs.append((cur_start, cur_owner, cur_views))
+            cur_start = None
+            cur_end = None
+            cur_owner = None
+            cur_views = []
+            cur_bytes = 0
+
+        for global_start, grad_flat in normalized:
+            size = int(grad_flat.size)
+            owner = int(global_start // self.shard_size)
+            byte_size = int(grad_flat.nbytes)
+            same_run = (
+                cur_views and global_start == cur_end and owner == cur_owner
+                and (cur_bytes + byte_size) <= max_bytes
+            )
+            if not same_run:
+                flush_run()
+                cur_start = int(global_start)
+                cur_end = int(global_start)
+                cur_owner = owner
+            cur_views.append(grad_flat)
+            cur_end += size
+            cur_bytes += byte_size
+        flush_run()
+
+        items2 = []
+        for global_start, owner, views in runs:
+            if len(views) == 1:
+                send_buf = cp.ascontiguousarray(views[0])
+            else:
+                send_buf = cp.ascontiguousarray(cp.concatenate(views).astype(cp.float16, copy=False))
+            items2.append((global_start, send_buf))
+        return self._prepare_reduce_parts(items2)
+
+    def _prepare_reduce_parts_owner_bucket(self, items, max_bytes=None):
+        """Prepare owner-wise reduce buckets.
+
+        This combines non-adjacent params with the same owner rank. The owner
+        receives one flat bucket and scatters segments into grad_shard. This is
+        reduce-scatter-like without requiring a full NCCL reduceScatter rewrite.
+        """
+        entries = self._split_items_by_owner(items)
+        if not entries:
+            return [], []
+        if max_bytes is None:
+            max_bytes = self.grad_bucket_max_bytes
+        max_bytes = max(1, int(max_bytes))
+
+        groups = []
+        cur_owner = None
+        cur_segments = []
+        cur_bytes = 0
+
+        def flush_group():
+            nonlocal cur_owner, cur_segments, cur_bytes
+            if cur_segments:
+                groups.append((cur_owner, cur_segments))
+            cur_owner = None
+            cur_segments = []
+            cur_bytes = 0
+
+        for owner, global_start, flat in entries:
+            b = int(flat.nbytes)
+            if cur_segments and (owner != cur_owner or cur_bytes + b > max_bytes):
+                flush_group()
+            if not cur_segments:
+                cur_owner = owner
+            cur_segments.append((global_start, flat))
+            cur_bytes += b
+        flush_group()
+
+        parts = []
+        kept_buffers = []
+        for owner, segments in groups:
+            views = [flat for _, flat in segments]
+            if len(views) == 1:
+                send_buf = cp.ascontiguousarray(views[0])
+            else:
+                send_buf = cp.ascontiguousarray(cp.concatenate(views).astype(cp.float16, copy=False))
+
+            recv_tmp = None
+            if self.rank == owner:
+                recv_tmp = cp.empty(send_buf.size, dtype=cp.float16)
+                recv_ptr = recv_tmp.data.ptr
+            else:
+                recv_ptr = send_buf.data.ptr
+
+            scatter = []
+            off = 0
+            shard_start = int(owner) * int(self.shard_size)
+            for global_start, flat in segments:
+                n = int(flat.size)
+                dst_off = int(global_start - shard_start)
+                scatter.append((dst_off, off, n))
+                off += n
+
+            parts.append({
+                "send_buf": send_buf,
+                "recv_ptr": recv_ptr,
+                "count": int(send_buf.size),
+                "owner": int(owner),
+                "recv_tmp": recv_tmp,
+                "scatter": scatter,
+            })
+            kept_buffers.append(send_buf)
+            if recv_tmp is not None:
+                kept_buffers.append(recv_tmp)
+        return parts, kept_buffers
+
+    def _enqueue_reduce_parts(self, prepared, tag=""):
+        if prepared is None:
+            return
+        parts, kept_buffers = prepared if isinstance(prepared, tuple) else (prepared, [])
         if not parts:
             return
 
@@ -987,34 +1288,138 @@ class MemoryZeRO3Manager:
         event = cp.cuda.Event()
         event.record(compute_stream)
         self.comm_stream.wait_event(event)
-        self.kept_buffers.append(event)
+        kept_buffers.append(event)
 
         with self.comm_stream:
             use_group = len(parts) > 1 and hasattr(nccl, "groupStart") and hasattr(nccl, "groupEnd")
             if use_group:
                 nccl.groupStart()
-            for send_part, recv_ptr, part_count, owner, dst_off, recv_tmp, direct_to_grad in parts:
-                self.comm.reduce(
-                    send_part.data.ptr,
-                    recv_ptr,
-                    part_count,
-                    nccl.NCCL_FLOAT16,
-                    nccl.NCCL_SUM,
-                    owner,
-                    self.comm_stream.ptr,
-                )
-            if use_group:
-                nccl.groupEnd()
+            try:
+                for send_part, recv_ptr, part_count, owner, dst_off, recv_tmp, direct_to_grad in parts:
+                    self.comm.reduce(
+                        send_part.data.ptr,
+                        recv_ptr,
+                        part_count,
+                        nccl.NCCL_FLOAT16,
+                        nccl.NCCL_SUM,
+                        owner,
+                        self.comm_stream.ptr,
+                    )
+            finally:
+                if use_group:
+                    nccl.groupEnd()
 
-            # Add only for microbatch >= 2. For the first one reduce wrote directly.
             for send_part, recv_ptr, part_count, owner, dst_off, recv_tmp, direct_to_grad in parts:
                 if self.rank == owner and recv_tmp is not None:
                     self.grad_shard_f16[dst_off: dst_off + part_count] += recv_tmp
 
+        done_event = cp.cuda.Event()
+        done_event.record(self.comm_stream)
+        self.pending_reduce_handles.append((done_event, kept_buffers, tag))
         self._has_pending_reduces = True
 
+    def _enqueue_owner_reduce_parts(self, prepared, tag=""):
+        if prepared is None:
+            return
+        parts, kept_buffers = prepared
+        if not parts:
+            return
+
+        compute_stream = cp.cuda.get_current_stream()
+        event = cp.cuda.Event()
+        event.record(compute_stream)
+        self.comm_stream.wait_event(event)
+        kept_buffers.append(event)
+
+        with self.comm_stream:
+            use_group = len(parts) > 1 and hasattr(nccl, "groupStart") and hasattr(nccl, "groupEnd")
+            if use_group:
+                nccl.groupStart()
+            try:
+                for part in parts:
+                    self.comm.reduce(
+                        part["send_buf"].data.ptr,
+                        part["recv_ptr"],
+                        part["count"],
+                        nccl.NCCL_FLOAT16,
+                        nccl.NCCL_SUM,
+                        part["owner"],
+                        self.comm_stream.ptr,
+                    )
+            finally:
+                if use_group:
+                    nccl.groupEnd()
+
+            for part in parts:
+                if self.rank != part["owner"] or part["recv_tmp"] is None:
+                    continue
+                recv_tmp = part["recv_tmp"]
+                for dst_off, src_off, n in part["scatter"]:
+                    dst = self.grad_shard_f16[dst_off: dst_off + n]
+                    src = recv_tmp[src_off:src_off + n]
+                    # Always add. grad_shard is zeroed at the start of the step,
+                    # and tied embeddings may receive multiple reductions to the
+                    # same rows within the first microbatch.
+                    dst += src
+
+        done_event = cp.cuda.Event()
+        done_event.record(self.comm_stream)
+        self.pending_reduce_handles.append((done_event, kept_buffers, tag))
+        self._has_pending_reduces = True
+
+    def _enqueue_grad_items(self, items, tag="grad_items", max_bytes=None):
+        if self.enable_owner_grad_bucket:
+            prepared = self._prepare_reduce_parts_owner_bucket(items, max_bytes=max_bytes)
+            self._enqueue_owner_reduce_parts(prepared, tag=tag)
+        elif self.enable_grad_bucket_flatten:
+            prepared = self._prepare_reduce_parts_flat_bucket(items)
+            self._enqueue_reduce_parts(prepared, tag=tag)
+        else:
+            prepared = self._prepare_reduce_parts(items)
+            self._enqueue_reduce_parts(prepared, tag=tag)
+
     def _reduce_flat_to_global(self, global_start, grad_flat):
-        self._enqueue_reduce_parts(self._prepare_reduce_parts([(global_start, grad_flat)]))
+        self._enqueue_reduce_parts(self._prepare_reduce_parts([(global_start, grad_flat)]), tag="single_reduce")
+
+    def begin_grad_bucket(self, tag=""):
+        if not self.enable_grad_bucket:
+            return False
+        if self._grad_bucket_active and self._grad_bucket_items:
+            self.flush_grad_bucket_async(tag=self._grad_bucket_tag or "auto_flush_before_begin")
+        self._grad_bucket_active = True
+        self._grad_bucket_items = []
+        self._grad_bucket_tag = str(tag)
+        return True
+
+    def add_grads_to_bucket(self, params, grads):
+        if grads is None:
+            return
+        if not self.enable_grad_bucket or not self._grad_bucket_active:
+            self.accumulate_grads(params, grads)
+            return
+        if isinstance(params, (list, tuple)):
+            for p, g in zip(params, grads):
+                if g is None:
+                    continue
+                param_idx = self.live_param_to_idx[id(p)]
+                global_start = self.param_offsets[param_idx]
+                self._grad_bucket_items.append((global_start, g.ravel()))
+            return
+        param_idx = self.live_param_to_idx[id(params)]
+        global_start = self.param_offsets[param_idx]
+        self._grad_bucket_items.append((global_start, grads.ravel()))
+
+    def flush_grad_bucket_async(self, tag=""):
+        if not self._grad_bucket_active and not self._grad_bucket_items:
+            return
+        bucket_tag = str(tag or self._grad_bucket_tag or "grad_bucket")
+        items = self._grad_bucket_items
+        self._grad_bucket_items = []
+        self._grad_bucket_active = False
+        self._grad_bucket_tag = ""
+        if not items:
+            return
+        self._enqueue_grad_items(items, tag=bucket_tag, max_bytes=self.grad_bucket_max_bytes)
 
     def accumulate_grads(self, params, grads):
         if grads is None:
@@ -1027,10 +1432,8 @@ class MemoryZeRO3Manager:
                 param_idx = self.live_param_to_idx[id(p)]
                 global_start = self.param_offsets[param_idx]
                 items.append((global_start, g.ravel()))
-            # One event + NCCL group per module instead of one event/reduce path per param.
-            self._enqueue_reduce_parts(self._prepare_reduce_parts(items))
+            self._enqueue_grad_items(items, tag="module_reduce", max_bytes=self.grad_bucket_max_bytes)
             return
-
         param_idx = self.live_param_to_idx[id(params)]
         global_start = self.param_offsets[param_idx]
         self._reduce_flat_to_global(global_start, grads.ravel())
@@ -1040,8 +1443,35 @@ class MemoryZeRO3Manager:
             return
         param_idx = self.live_param_to_idx[id(param)]
         H = self.param_shapes[param_idx][1]
-        global_start = self.param_offsets[param_idx] + row_start * H
+        global_start = self.param_offsets[param_idx] + int(row_start) * int(H)
         self._reduce_flat_to_global(global_start, grad_chunk.reshape(-1))
+
+    def accumulate_grad_slice_bucketed(self, param, row_start, row_end, grad_chunk):
+        """Buffer dense sliced embedding/LM-head grads before async reduce."""
+        if grad_chunk is None:
+            return
+        if not self.enable_embedding_grad_bucket:
+            self.accumulate_grad_slice(param, row_start, row_end, grad_chunk)
+            return
+        param_idx = self.live_param_to_idx[id(param)]
+        H = self.param_shapes[param_idx][1]
+        global_start = self.param_offsets[param_idx] + int(row_start) * int(H)
+        flat = grad_chunk.reshape(-1)
+        if flat.dtype != cp.float16:
+            flat = flat.astype(cp.float16)
+        flat = cp.ascontiguousarray(flat)
+        self._embedding_grad_bucket_items.append((int(global_start), flat))
+        self._embedding_grad_bucket_bytes += int(flat.nbytes)
+        if self._embedding_grad_bucket_bytes >= self.embedding_grad_bucket_max_bytes:
+            self.flush_embedding_grad_bucket_async(tag="embedding_ce_bucket")
+
+    def flush_embedding_grad_bucket_async(self, tag="embedding_bucket"):
+        if not self._embedding_grad_bucket_items:
+            return
+        items = self._embedding_grad_bucket_items
+        self._embedding_grad_bucket_items = []
+        self._embedding_grad_bucket_bytes = 0
+        self._enqueue_grad_items(items, tag=tag, max_bytes=self.embedding_grad_bucket_max_bytes)
 
     def accumulate_embedding_grads_chunked(self, param, idx, dout, padding_id=None, vocab_chunk_size=8192):
         if idx is None:
@@ -1084,7 +1514,8 @@ class MemoryZeRO3Manager:
             rows = cp.where((unique_ids >= s) & (unique_ids < e))[0]
             chunk_grad = cp.zeros((e - s, H), dtype=grad_rows.dtype)
             chunk_grad[unique_ids[rows] - s] = grad_rows[rows]
-            self.accumulate_grad_slice(param, s, e, chunk_grad)
+            self.accumulate_grad_slice_bucketed(param, s, e, chunk_grad)
+        self.flush_embedding_grad_bucket_async(tag="embedding_input_bucket")
 
     def check_nan_inf(self, grad_shard, comm, stream):
         local_bad = cp.logical_not(cp.isfinite(grad_shard)).any()
