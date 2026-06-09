@@ -8,6 +8,7 @@ os.environ.setdefault("NCCL_P2P_DISABLE", "1")
 os.environ.setdefault("NCCL_IB_DISABLE", "1")
 os.environ.setdefault("NCCL_SOCKET_IFNAME", "lo") # 同一ノード内通信を想定
 
+
 """
 150日まで短縮できている
 CPU Offloadは固い
