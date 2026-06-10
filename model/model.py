@@ -118,6 +118,10 @@ class Cupa_ver4:
         self.zero3_embedding_grad_bucket = bool(model_dic.get('zero3_embedding_grad_bucket', True))
         self.zero3_embedding_grad_bucket_max_bytes = int(model_dic.get('zero3_embedding_grad_bucket_max_bytes', 64 * 1024 * 1024))
 
+        # False by default: avoid CPU-side synchronize after every param broadcast.
+        # Set True only for debugging if stream ordering issues are suspected.
+        self.zero3_sync_gather = bool(model_dic.get('zero3_sync_gather', False))
+
         flash_backend = str(model_dic.get("flash_backend", "none"))
         flash_block_m = int(model_dic.get("flash_block_m", 64))
         flash_block_n = int(model_dic.get("flash_block_n", 64))

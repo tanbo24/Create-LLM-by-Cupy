@@ -315,8 +315,17 @@ def training_worker_nccl_stream(rank, world_size, comm_id, all_args, batch_size,
                         model.backward(GradScale, manager)
                         loss_accum_gpu += loss_i.astype(cp.float32)
 
-                        # backward enqueues many async NCCL reductions. Complete them once per microbatch.
-                        manager.synchronize()
+                        # Memory-safe default: complete async grad reductions each microbatch.
+                        # The previous fast path kept reduce buffers alive across accumulation,
+                        # which can OOM on A4000-class 16GB GPUs.
+                        if getattr(manager, "sync_after_each_microbatch", True):
+                            manager.synchronize()
+                        else:
+                            manager.flush_buckets()
+                            manager.progress_async_reduces(
+                                max_pending=getattr(manager, "max_pending_reduces", 1),
+                                force=False,
+                            )
 
                         if profile_timing:
                             end = time.perf_counter()
@@ -334,14 +343,19 @@ def training_worker_nccl_stream(rank, world_size, comm_id, all_args, batch_size,
 
                     final_base_scale = 1.0 / (world_size * all_args['accum_step'] * GradScale)
                     
-                    if manager.check_nan_inf(manager.grad_shard_f16, comm, h2d_stream):
+                    # One fused full-shard pass + one allReduce: NaN/Inf check and grad norm.
+                    # The old path scanned grad_shard twice and synchronized twice.
+                    grad_sq_sum, grad_has_bad = manager.calculate_global_grad_stats(
+                        manager.grad_shard_f16, comm, h2d_stream
+                    )
+                    if grad_has_bad:
                         GradScale = Scaling.UpdateScale(True) # NaN検知時はスケールダウンしてスキップ
                         if is_main_device:
                             print(f"Iter {iters}: Update SKIPPED due to NaN/Inf. New Scale: {GradScale}")
                         continue
                     
                     # グローバルノルム計算とクリッピング
-                    g_norm = manager.calculate_global_grad_norm(manager.grad_shard_f16, comm, h2d_stream)
+                    g_norm = float(np.sqrt(grad_sq_sum))
                     actual_norm = g_norm * final_base_scale
                     clip_coef = min(1.0, all_args['max_grads'] / (actual_norm + 1e-6))
                     
@@ -726,6 +740,61 @@ l2_sq_sum_kernel = cp.ReductionKernel(
     'l2_sq_sum_kernel'
 )
 
+# Fused grad-stat kernel: one full pass over fp16 grad shard computes both
+# L2-squared sum and NaN/Inf flag. This replaces separate isfinite() and
+# norm passes, which is closer to PyTorch AMP/FSDP-style fused unscale/check.
+_grad_stats_f16_kernel = cp.RawKernel(r'''
+#include <cuda_fp16.h>
+extern "C" __global__
+void grad_stats_f16_kernel(
+    const half* __restrict__ grad,
+    float* __restrict__ block_sum,
+    float* __restrict__ block_bad,
+    const long long n
+) {
+    int tid = threadIdx.x;
+    int bid = blockIdx.x;
+    int bdim = blockDim.x;
+    long long stride = (long long)bdim * (long long)gridDim.x;
+    long long i = (long long)bid * (long long)bdim + (long long)tid;
+
+    extern __shared__ float smem[];
+    float* ssum = smem;
+    float* sbad = smem + bdim;
+
+    float sum = 0.0f;
+    float bad = 0.0f;
+
+    for (; i < n; i += stride) {
+        float v = __half2float(grad[i]);
+        // Avoid <math.h> because some NVRTC environments cannot locate C headers.
+        // NaN: v != v. Inf: magnitude exceeds finite fp32 max.
+        if (!(v == v) || v > 3.402823466e38f || v < -3.402823466e38f) {
+            bad = 1.0f;
+        } else {
+            sum += v * v;
+        }
+    }
+
+    ssum[tid] = sum;
+    sbad[tid] = bad;
+    __syncthreads();
+
+    for (int off = bdim >> 1; off > 0; off >>= 1) {
+        if (tid < off) {
+            ssum[tid] += ssum[tid + off];
+            sbad[tid] = (sbad[tid] > sbad[tid + off]) ? sbad[tid] : sbad[tid + off];
+        }
+        __syncthreads();
+    }
+
+    if (tid == 0) {
+        block_sum[bid] = ssum[0];
+        block_bad[bid] = sbad[0];
+    }
+}
+''', 'grad_stats_f16_kernel')
+
 class MemoryZeRO3Manager:
     """
     ZeRO-3 style parameter sharding:
@@ -769,6 +838,16 @@ class MemoryZeRO3Manager:
             model, "zero3_backward_param_prefetch", getattr(model, "zero3_param_prefetch", True)
         ))
         self.enable_param_prefetch = self.enable_forward_param_prefetch or self.enable_backward_param_prefetch
+
+        # Debug fallback only. In normal training, gather broadcasts are queued on
+        # the compute stream, so a host synchronize is not required before the
+        # next CuPy matmul on the same stream. PyTorch/FSDP also avoids this kind
+        # of CPU-side wait on every gathered module.
+        self.sync_gather = bool(getattr(model, "zero3_sync_gather", False))
+        # Memory-safe mode: synchronize reductions after each microbatch.
+        # This gives back some overlap, but prevents async reduce/recv buffers
+        # from accumulating across accum_step and causing OOM on 16GB GPUs.
+        self.sync_after_each_microbatch = bool(getattr(model, "zero3_sync_after_each_microbatch", True))
 
         # Transformer block grad bucketization.
         self.enable_grad_bucket = bool(getattr(model, "zero3_grad_bucket", True))
@@ -975,7 +1054,8 @@ class MemoryZeRO3Manager:
         既存コード互換用。
         """
         params = [self._broadcast_param(i) for i in module._zero3_param_indices]
-        self.stream.synchronize()
+        if self.sync_gather:
+            self.stream.synchronize()
         module.params = params
         return params
 
@@ -986,7 +1066,8 @@ class MemoryZeRO3Manager:
         """
         for module in modules:
             module.params = [self._broadcast_param(i) for i in module._zero3_param_indices]
-        self.stream.synchronize()
+        if self.sync_gather:
+            self.stream.synchronize()
 
     def release_module(self, module):
         if getattr(module, "params", None) is not None:
@@ -1016,7 +1097,8 @@ class MemoryZeRO3Manager:
             return W
 
         W = self._broadcast_param(self.model._zero3_embedding_idx)
-        self.stream.synchronize()
+        if self.sync_gather:
+            self.stream.synchronize()
         self.model.Af_Em_para = [W]
         return W
 
@@ -1516,6 +1598,54 @@ class MemoryZeRO3Manager:
             chunk_grad[unique_ids[rows] - s] = grad_rows[rows]
             self.accumulate_grad_slice_bucketed(param, s, e, chunk_grad)
         self.flush_embedding_grad_bucket_async(tag="embedding_input_bucket")
+
+    def calculate_global_grad_stats(self, grad_shard, comm, stream):
+        """Return (global_sum_sq, has_nan_or_inf) with one grad-shard scan.
+
+        This is intended for the training step boundary after synchronize(),
+        so all async reductions have already landed in grad_shard_f16.
+        """
+        if grad_shard.dtype != cp.float16:
+            # Conservative fallback for non-fp16 debug runs.
+            finite = cp.isfinite(grad_shard)
+            bad = cp.logical_not(finite).any()
+            safe = cp.where(finite, grad_shard.astype(cp.float32), 0.0)
+            stats = cp.array([cp.sum(safe * safe), bad.astype(cp.float32)], dtype=cp.float32)
+            with stream:
+                comm.allReduce(
+                    stats.data.ptr, stats.data.ptr, 2,
+                    nccl.NCCL_FLOAT32, nccl.NCCL_SUM, stream.ptr
+                )
+            stream.synchronize()
+            return float(stats[0]), bool(float(stats[1]) > 0.0)
+
+        n = int(grad_shard.size)
+        if n == 0:
+            return 0.0, False
+
+        threads = 256
+        blocks = min(4096, max(1, (n + threads - 1) // threads))
+        block_sum = cp.empty((blocks,), dtype=cp.float32)
+        block_bad = cp.empty((blocks,), dtype=cp.float32)
+
+        _grad_stats_f16_kernel(
+            (blocks,), (threads,),
+            (grad_shard, block_sum, block_bad, np.int64(n)),
+            shared_mem=threads * 2 * 4,
+            stream=stream,
+        )
+
+        stats = cp.empty((2,), dtype=cp.float32)
+        stats[0] = cp.sum(block_sum)
+        stats[1] = cp.max(block_bad)
+
+        with stream:
+            comm.allReduce(
+                stats.data.ptr, stats.data.ptr, 2,
+                nccl.NCCL_FLOAT32, nccl.NCCL_SUM, stream.ptr
+            )
+        stream.synchronize()
+        return float(stats[0]), bool(float(stats[1]) > 0.0)
 
     def check_nan_inf(self, grad_shard, comm, stream):
         local_bad = cp.logical_not(cp.isfinite(grad_shard)).any()

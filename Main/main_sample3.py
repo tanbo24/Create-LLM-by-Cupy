@@ -85,7 +85,7 @@ if __name__ == "__main__":
         # True: forwardでgatherした共有embeddingをbackwardまで保持して巨大broadcastを1回削減
         'keep_embedding_until_backward': True,
 
-        'ce_chunk_size': 40000,
+        'ce_chunk_size': 10000,
 
         'gqa_cache_attn': False,
         'gqa_cache_out_value': False,
@@ -111,11 +111,15 @@ if __name__ == "__main__":
         'zero3_embedding_grad_bucket': True,
         'zero3_embedding_grad_bucket_max_bytes': 256 * 1024 * 1024,
 
+        # Fast path: queue broadcasts on the compute stream without host-side sync.
+        # If you suspect NCCL stream-order trouble, flip this to True for debugging only.
+        'zero3_sync_gather': False,
+
         'flash_backend': 'cupy',
         'flash_block_m': 512,
-        'flash_block_n': 256,
+        'flash_block_n': 512,
         'flash_bwd_block_m': 512,
-        'flash_bwd_block_n': 256,
+        'flash_bwd_block_n': 512,
         'flash_bwd_block_d': 256,
     }
     
@@ -138,6 +142,7 @@ if __name__ == "__main__":
                 ,GradScale_dic,model_dic
                 ,main_device,half_float,
                 save_step,data_chunk_num,
-                vali_step)
+                vali_step,
+                optimizer_device="cpu")
     
     trainer.fit(data_size)
