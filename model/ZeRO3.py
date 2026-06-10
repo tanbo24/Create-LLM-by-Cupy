@@ -694,7 +694,7 @@ class TrainMultiGPU:
             'data_chunk_num':self.data_chunk_num,'vali_step':self.vali_step,'vali':self.vali,
             'train_continue_path':self.train_continue_path,
             'optimizer_device':self.optimizer_device,
-            'profile_timing': False,
+            'profile_timing': True,
         }
         
 

@@ -828,6 +828,270 @@ class SwiGLU:
 
     
 
+# ======================================================================================
+# Fused RMSNorm RawKernels
+# ======================================================================================
+_rmsnorm_fwd_f16_kernel = cp.RawKernel(r'''
+#include <cuda_fp16.h>
+extern "C" __global__
+void rmsnorm_fwd_f16_kernel(
+    const half* __restrict__ x,
+    const half* __restrict__ gamma,
+    half* __restrict__ out,
+    float* __restrict__ rsqrt_out,
+    const int N,
+    const int H,
+    const float eps
+) {
+    int row = blockIdx.x;
+    int tid = threadIdx.x;
+    extern __shared__ float smem[];
+
+    if (row >= N) return;
+
+    float sum_sq = 0.0f;
+    long long base = (long long)row * (long long)H;
+    for (int h = tid; h < H; h += blockDim.x) {
+        float xv = __half2float(x[base + h]);
+        sum_sq += xv * xv;
+    }
+
+    smem[tid] = sum_sq;
+    __syncthreads();
+
+    for (int stride = blockDim.x >> 1; stride > 0; stride >>= 1) {
+        if (tid < stride) smem[tid] += smem[tid + stride];
+        __syncthreads();
+    }
+
+    float r = rsqrtf(smem[0] / (float)H + eps);
+    if (tid == 0) rsqrt_out[row] = r;
+
+    for (int h = tid; h < H; h += blockDim.x) {
+        float xv = __half2float(x[base + h]);
+        float gv = __half2float(gamma[h]);
+        out[base + h] = __float2half_rn(xv * r * gv);
+    }
+}
+''', 'rmsnorm_fwd_f16_kernel')
+
+_rmsnorm_fwd_f32_kernel = cp.RawKernel(r'''
+extern "C" __global__
+void rmsnorm_fwd_f32_kernel(
+    const float* __restrict__ x,
+    const float* __restrict__ gamma,
+    float* __restrict__ out,
+    float* __restrict__ rsqrt_out,
+    const int N,
+    const int H,
+    const float eps
+) {
+    int row = blockIdx.x;
+    int tid = threadIdx.x;
+    extern __shared__ float smem[];
+
+    if (row >= N) return;
+
+    float sum_sq = 0.0f;
+    long long base = (long long)row * (long long)H;
+    for (int h = tid; h < H; h += blockDim.x) {
+        float xv = x[base + h];
+        sum_sq += xv * xv;
+    }
+
+    smem[tid] = sum_sq;
+    __syncthreads();
+
+    for (int stride = blockDim.x >> 1; stride > 0; stride >>= 1) {
+        if (tid < stride) smem[tid] += smem[tid + stride];
+        __syncthreads();
+    }
+
+    float r = rsqrtf(smem[0] / (float)H + eps);
+    if (tid == 0) rsqrt_out[row] = r;
+
+    for (int h = tid; h < H; h += blockDim.x) {
+        out[base + h] = x[base + h] * r * gamma[h];
+    }
+}
+''', 'rmsnorm_fwd_f32_kernel')
+
+_rmsnorm_dgamma_f16_kernel = cp.RawKernel(r'''
+#include <cuda_fp16.h>
+extern "C" __global__
+void rmsnorm_dgamma_f16_kernel(
+    const half* __restrict__ dout,
+    const half* __restrict__ y,
+    const half* __restrict__ gamma,
+    half* __restrict__ dgamma,
+    const int N,
+    const int H,
+    const float gamma_eps
+) {
+    int h = blockIdx.x;
+    int tid = threadIdx.x;
+    extern __shared__ float smem[];
+
+    if (h >= H) return;
+
+    float sum = 0.0f;
+    float gv = __half2float(gamma[h]) + gamma_eps;
+    for (int row = tid; row < N; row += blockDim.x) {
+        long long idx = (long long)row * (long long)H + h;
+        float dy = __half2float(dout[idx]);
+        float yy = __half2float(y[idx]);
+        float xnorm = yy / gv;
+        sum += dy * xnorm;
+    }
+
+    smem[tid] = sum;
+    __syncthreads();
+
+    for (int stride = blockDim.x >> 1; stride > 0; stride >>= 1) {
+        if (tid < stride) smem[tid] += smem[tid + stride];
+        __syncthreads();
+    }
+
+    if (tid == 0) dgamma[h] = __float2half_rn(smem[0]);
+}
+''', 'rmsnorm_dgamma_f16_kernel')
+
+_rmsnorm_dgamma_f32_kernel = cp.RawKernel(r'''
+extern "C" __global__
+void rmsnorm_dgamma_f32_kernel(
+    const float* __restrict__ dout,
+    const float* __restrict__ y,
+    const float* __restrict__ gamma,
+    float* __restrict__ dgamma,
+    const int N,
+    const int H,
+    const float gamma_eps
+) {
+    int h = blockIdx.x;
+    int tid = threadIdx.x;
+    extern __shared__ float smem[];
+
+    if (h >= H) return;
+
+    float sum = 0.0f;
+    float gv = gamma[h] + gamma_eps;
+    for (int row = tid; row < N; row += blockDim.x) {
+        long long idx = (long long)row * (long long)H + h;
+        float xnorm = y[idx] / gv;
+        sum += dout[idx] * xnorm;
+    }
+
+    smem[tid] = sum;
+    __syncthreads();
+
+    for (int stride = blockDim.x >> 1; stride > 0; stride >>= 1) {
+        if (tid < stride) smem[tid] += smem[tid + stride];
+        __syncthreads();
+    }
+
+    if (tid == 0) dgamma[h] = smem[0];
+}
+''', 'rmsnorm_dgamma_f32_kernel')
+
+_rmsnorm_bwd_dx_f16_kernel = cp.RawKernel(r'''
+#include <cuda_fp16.h>
+extern "C" __global__
+void rmsnorm_bwd_dx_f16_kernel(
+    const half* __restrict__ dout,
+    const half* __restrict__ y,
+    const half* __restrict__ gamma,
+    const float* __restrict__ rsqrt_in,
+    half* __restrict__ dx,
+    const int N,
+    const int H,
+    const float gamma_eps
+) {
+    int row = blockIdx.x;
+    int tid = threadIdx.x;
+    extern __shared__ float smem[];
+
+    if (row >= N) return;
+
+    long long base = (long long)row * (long long)H;
+    float dot = 0.0f;
+    for (int h = tid; h < H; h += blockDim.x) {
+        float dy = __half2float(dout[base + h]);
+        float gv = __half2float(gamma[h]);
+        float xnorm = __half2float(y[base + h]) / (gv + gamma_eps);
+        float dnorm = dy * gv;
+        dot += dnorm * xnorm;
+    }
+
+    smem[tid] = dot;
+    __syncthreads();
+
+    for (int stride = blockDim.x >> 1; stride > 0; stride >>= 1) {
+        if (tid < stride) smem[tid] += smem[tid + stride];
+        __syncthreads();
+    }
+
+    float mean_dot = smem[0] / (float)H;
+    float r = rsqrt_in[row];
+
+    for (int h = tid; h < H; h += blockDim.x) {
+        float dy = __half2float(dout[base + h]);
+        float gv = __half2float(gamma[h]);
+        float xnorm = __half2float(y[base + h]) / (gv + gamma_eps);
+        float dnorm = dy * gv;
+        float v = r * (dnorm - xnorm * mean_dot);
+        dx[base + h] = __float2half_rn(v);
+    }
+}
+''', 'rmsnorm_bwd_dx_f16_kernel')
+
+_rmsnorm_bwd_dx_f32_kernel = cp.RawKernel(r'''
+extern "C" __global__
+void rmsnorm_bwd_dx_f32_kernel(
+    const float* __restrict__ dout,
+    const float* __restrict__ y,
+    const float* __restrict__ gamma,
+    const float* __restrict__ rsqrt_in,
+    float* __restrict__ dx,
+    const int N,
+    const int H,
+    const float gamma_eps
+) {
+    int row = blockIdx.x;
+    int tid = threadIdx.x;
+    extern __shared__ float smem[];
+
+    if (row >= N) return;
+
+    long long base = (long long)row * (long long)H;
+    float dot = 0.0f;
+    for (int h = tid; h < H; h += blockDim.x) {
+        float gv = gamma[h];
+        float xnorm = y[base + h] / (gv + gamma_eps);
+        float dnorm = dout[base + h] * gv;
+        dot += dnorm * xnorm;
+    }
+
+    smem[tid] = dot;
+    __syncthreads();
+
+    for (int stride = blockDim.x >> 1; stride > 0; stride >>= 1) {
+        if (tid < stride) smem[tid] += smem[tid + stride];
+        __syncthreads();
+    }
+
+    float mean_dot = smem[0] / (float)H;
+    float r = rsqrt_in[row];
+
+    for (int h = tid; h < H; h += blockDim.x) {
+        float gv = gamma[h];
+        float xnorm = y[base + h] / (gv + gamma_eps);
+        float dnorm = dout[base + h] * gv;
+        dx[base + h] = r * (dnorm - xnorm * mean_dot);
+    }
+}
+''', 'rmsnorm_bwd_dx_f32_kernel')
+
+
 class RMSNorm:
     def __init__(self, hidden_size, half_float, eps=1e-6):
         self.hidden_size = hidden_size
@@ -838,8 +1102,11 @@ class RMSNorm:
         self.params = [cp.ones(hidden_size, dtype=dtype)]
         self.cache = None
         self.grads = []
+        self.use_raw_kernel = True
+        self._raw_kernel_disabled = False
+        self._last_input_shape = None
 
-    def forward(self, x, is_train=True):
+    def _forward_fallback(self, x, is_train=True):
         ga = self.params[0]
 
         if self.half_float:
@@ -852,24 +1119,62 @@ class RMSNorm:
         ms = cp.mean(cp.square(x_f32), axis=-1, keepdims=True)
         rsqrt = 1.0 / cp.sqrt(ms + self.eps)
         x_norm = x_f32 * rsqrt
-
         out = x_norm * ga_f
 
         if is_train:
-            # x_normは保存しない。小さいrsqrtだけ保存する
-            self.cache = rsqrt
+            self.cache = rsqrt.reshape(-1).astype(cp.float32, copy=False)
+            self._last_input_shape = x.shape
 
         if self.half_float:
             out = out.astype(cp.float16)
-
         return out
 
-    def backward(self, dout, y):
-        """
-        y = RMSNorm forwardの出力。
-        つまり y = x_norm * gamma。
-        次層がcacheしているRMSNorm出力を渡して使う。
-        """
+    def forward(self, x, is_train=True):
+        if (not self.use_raw_kernel) or self._raw_kernel_disabled:
+            return self._forward_fallback(x, is_train=is_train)
+
+        try:
+            ga = self.params[0]
+            H = int(self.hidden_size)
+            N = int(x.size // H)
+            original_shape = x.shape
+
+            x_flat = x.reshape(N, H)
+            if not x_flat.flags.c_contiguous:
+                x_flat = cp.ascontiguousarray(x_flat)
+
+            out = cp.empty_like(x)
+            out_flat = out.reshape(N, H)
+            rsqrt = cp.empty((N,), dtype=cp.float32)
+
+            threads = 256
+            shared_mem = threads * 4
+            if self.half_float:
+                if x_flat.dtype != cp.float16 or ga.dtype != cp.float16:
+                    return self._forward_fallback(x, is_train=is_train)
+                _rmsnorm_fwd_f16_kernel(
+                    (N,), (threads,),
+                    (x_flat, ga, out_flat, rsqrt, N, H, cp.float32(self.eps)),
+                    shared_mem=shared_mem,
+                )
+            else:
+                if x_flat.dtype != cp.float32 or ga.dtype != cp.float32:
+                    return self._forward_fallback(x, is_train=is_train)
+                _rmsnorm_fwd_f32_kernel(
+                    (N,), (threads,),
+                    (x_flat, ga, out_flat, rsqrt, N, H, cp.float32(self.eps)),
+                    shared_mem=shared_mem,
+                )
+
+            if is_train:
+                self.cache = rsqrt
+                self._last_input_shape = original_shape
+            return out
+        except Exception:
+            self._raw_kernel_disabled = True
+            return self._forward_fallback(x, is_train=is_train)
+
+    def _backward_fallback(self, dout, y):
         if self.half_float:
             dout = dout.astype(cp.float32)
             y = y.astype(cp.float32)
@@ -879,9 +1184,9 @@ class RMSNorm:
             ga = ga.astype(cp.float32)
 
         rsqrt = self.cache
+        if rsqrt is not None and rsqrt.ndim == 1:
+            rsqrt = rsqrt.reshape(y.shape[0], y.shape[1], 1)
 
-        # y = x_norm * ga なので x_norm を復元
-        # gammaが0に近いと危険なのでepsを入れる
         inv_ga = 1.0 / (ga + cp.float32(1e-6))
         x_norm = y * inv_ga
 
@@ -898,9 +1203,77 @@ class RMSNorm:
 
         self.grads = [d_ga]
         self.cache = None
+        self._last_input_shape = None
         return dx
-    
 
+    def backward(self, dout, y):
+        """
+        y = RMSNorm forwardの出力。
+        つまり y = x_norm * gamma。
+        次層がcacheしているRMSNorm出力を渡して使う。
+        """
+        if self.cache is None:
+            raise RuntimeError("RMSNorm backward called before forward or cache has already been cleared.")
+
+        if (not self.use_raw_kernel) or self._raw_kernel_disabled:
+            return self._backward_fallback(dout, y)
+
+        try:
+            ga = self.params[0]
+            H = int(self.hidden_size)
+            N = int(dout.size // H)
+            out_shape = dout.shape
+
+            dout_flat = dout.reshape(N, H)
+            y_flat = y.reshape(N, H)
+            if not dout_flat.flags.c_contiguous:
+                dout_flat = cp.ascontiguousarray(dout_flat)
+            if not y_flat.flags.c_contiguous:
+                y_flat = cp.ascontiguousarray(y_flat)
+
+            rsqrt = self.cache.reshape(N)
+            dx = cp.empty_like(dout)
+            dx_flat = dx.reshape(N, H)
+            d_ga = cp.empty_like(ga)
+
+            threads = 256
+            shared_mem = threads * 4
+            gamma_eps = cp.float32(1e-6)
+
+            if self.half_float:
+                if dout_flat.dtype != cp.float16 or y_flat.dtype != cp.float16 or ga.dtype != cp.float16:
+                    return self._backward_fallback(dout, y)
+                _rmsnorm_dgamma_f16_kernel(
+                    (H,), (threads,),
+                    (dout_flat, y_flat, ga, d_ga, N, H, gamma_eps),
+                    shared_mem=shared_mem,
+                )
+                _rmsnorm_bwd_dx_f16_kernel(
+                    (N,), (threads,),
+                    (dout_flat, y_flat, ga, rsqrt, dx_flat, N, H, gamma_eps),
+                    shared_mem=shared_mem,
+                )
+            else:
+                if dout_flat.dtype != cp.float32 or y_flat.dtype != cp.float32 or ga.dtype != cp.float32:
+                    return self._backward_fallback(dout, y)
+                _rmsnorm_dgamma_f32_kernel(
+                    (H,), (threads,),
+                    (dout_flat, y_flat, ga, d_ga, N, H, gamma_eps),
+                    shared_mem=shared_mem,
+                )
+                _rmsnorm_bwd_dx_f32_kernel(
+                    (N,), (threads,),
+                    (dout_flat, y_flat, ga, rsqrt, dx_flat, N, H, gamma_eps),
+                    shared_mem=shared_mem,
+                )
+
+            self.grads = [d_ga]
+            self.cache = None
+            self._last_input_shape = None
+            return dx.reshape(out_shape)
+        except Exception:
+            self._raw_kernel_disabled = True
+            return self._backward_fallback(dout, y)
     
 
     

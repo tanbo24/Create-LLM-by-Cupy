@@ -35,9 +35,9 @@ if __name__ == "__main__":
     hidden_size=3072
     time_size=1024#これ1000越えはいけるのでは？
     dropout_rate=0#ゼロであればdropoutインスタンスは生成されない
-    layer_num=37
+    layer_num=27
     q_head=16
-    kv_head=2
+    kv_head=4
     half_float=True
 
     #optimizer
@@ -56,9 +56,9 @@ if __name__ == "__main__":
     main_device=0
 
     #etc
-    batch_size=14
+    batch_size=12
     max_epoch=1
-    accum_step=7
+    accum_step=8
     data_chunk_num=100
     max_grads=1
     save_step=2000
@@ -85,7 +85,7 @@ if __name__ == "__main__":
         # True: forwardでgatherした共有embeddingをbackwardまで保持して巨大broadcastを1回削減
         'keep_embedding_until_backward': True,
 
-        'ce_chunk_size': 4000,
+        'ce_chunk_size': 10000,
 
         'gqa_cache_attn': False,
         'gqa_cache_out_value': False,
@@ -112,11 +112,11 @@ if __name__ == "__main__":
         'zero3_embedding_grad_bucket_max_bytes': 256 * 1024 * 1024,
 
         'flash_backend': 'cupy',
-        'flash_block_m': 128,
-        'flash_block_n': 128,
-        'flash_bwd_block_m': 128,
-        'flash_bwd_block_n': 128,
-        'flash_bwd_block_d': 128,
+        'flash_block_m': 512,
+        'flash_block_n': 256,
+        'flash_bwd_block_m': 512,
+        'flash_bwd_block_n': 256,
+        'flash_bwd_block_d': 256,
     }
     
     GradScale_dic = {
