@@ -32,10 +32,10 @@ if __name__ == "__main__":
 
     #model
     vocab_size = 8_0000
-    hidden_size=3072
-    time_size=1024#これ1000越えはいけるのでは？
+    hidden_size=3840
+    time_size=1024
     dropout_rate=0#ゼロであればdropoutインスタンスは生成されない
-    layer_num=27
+    layer_num=23
     q_head=16
     kv_head=4
     half_float=True
@@ -85,7 +85,7 @@ if __name__ == "__main__":
         # True: forwardでgatherした共有embeddingをbackwardまで保持して巨大broadcastを1回削減
         'keep_embedding_until_backward': True,
 
-        'ce_chunk_size': 10000,
+        'ce_chunk_size': 40000,
 
         'gqa_cache_attn': False,
         'gqa_cache_out_value': False,
